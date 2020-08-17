@@ -36,199 +36,227 @@ class ActorCritic(Model):
     self.critic = layers.Dense(1, kernel_initializer=kernel_init)
 
   def call(self, inputs: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-    x = self.dense(self.conv2(self.conv1(inputs)))
+    print(inputs.shape)
+    print(self.conv1.get_weights())
+    try:
+      x = self.conv1(inputs)
+      print(x.shape)
+      x = self.conv2(x)
+      print(x.shape)
+      x = self.dense(x)
+    except:
+      print("this isn't good")
+    # x = self.dense(self.conv2(self.conv1(inputs)))
+    print(x.shape)
     return self.actor(x), self.critic(x)
 
-# model = ActorCritic((32, 32, 1), 5)
-# model(np.random.random((1, 32, 32, 1)))
-# model_weights = model.get_weights()
+critic_loss_func = tf.keras.losses.Huber(reduction=tf.keras.losses.Reduction.SUM)
 
 class Worker(Process):
   global_step_counter = 0
-  ma_reward, top_reward = 0, 0, 0
+  global_ma_reward, global_top_reward = 0, 0
   write_lock = Lock()
 
-  def __init__(self, state_size, action_size, global_model, global_opt, worker_id, write_fp='/tmp'):
+  def __init__(self, state_size, action_size, weight_names, weight_shapes, weight_dtype, global_opt, results, worker_id, write_fp='/tmp'):
     super(Worker, self).__init__()
     self.state_size = state_size
     self.action_size = action_size
     self.local_model = ActorCritic(self.state_size, self.action_size)
+    self.local_model(np.random.random((1, *self.state_size)).astype("float32"))
 
-    self.global_model = global_model
     self.global_opt = global_opt
+    self.results = results
     self.worker_id = worker_id
     self.write_fp = write_fp
 
     self.env = gym.make('SpaceInvaders-v0').unwrapped
     self.episode_loss = 0.0
-    self.states = []
-    self.actions = []
-    self.rewards = []
 
-  def clear_mem(self):
-    self.states = []
-    self.actions = []
-    self.rewards = []
+    self.weight_names = weight_names
+    self.global_weights = []
+    for weight_name, weight_shape in zip(weight_names, weight_shapes):
+      memory = shared_memory.SharedMemory(name=weight_name)
+      weight = np.ndarray(weight_shape, dtype=weight_dtype, buffer=memory.buf)
+      self.global_weights.append(weight)
+
+    self.local_model.set_weights(self.global_weights)
+    self.local_model(np.random.random((1, *self.state_size)).astype("float32"))
 
   def run(self):
-    thread_step_counter = 1
-    
-    # Run an episode if the global maximum hasn't stopped
-    while Worker.num_episode < args["max_eps"]:
-      # Reset and get params?
+    try:
+      thread_step_counter = 1
+      
+      # Run an episode if the global maximum hasn't stopped
+      while Worker.global_step_counter < args["max_steps"]:
+        # Reset and get params?
+        episode_reward, episode_loss = 0, 0
+        t_start = thread_step_counter
+        state = self.env.reset()
+        print("----------- START ENV -----------")
+        # Calculate gradient wrt to local model
+        with tf.GradientTape() as tape:
+          # Create arrays to track and hold our results
+          values = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+          rewards = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+          action_probs = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+          probs = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+          
+          # Run simulation until episode done or update time
+          done = False
+          while not done and thread_step_counter - t_start != args["update_freq"]:
+            print(thread_step_counter, t_start)
+            # Take action according to policy
+            logits, value = self.local_model(tf.cast(state[np.newaxis, :], tf.float32))
+            print(logits, value)
+            probs = tf.nn.softmax(logits).numpy()[0]
+            action = np.random.choice(len(probs), p=probs)
+            next_state, reward, done, _ = self.env.step(action)
 
-      t_start = thread_step_counter
-      current_state = self.env.reset()
+            print(reward)
 
-      clear_mem()
-      ep_reward = 0.0
-      ep_steps = 0
-      self.ep_loss = 0.0
+            # Store action probs, values, and rewards
+            t = thread_step_counter - t_stasrt
+            values = values.write(t, value[0])
+            rewards = rewards.write(t, reward)
+            action_probs = action_probs.write(t, probs[action])
+            probs = probs.write(t, probs)
 
-      done = False
-      while not done:
-        logits, _ = self.local_model(tf.convert_to_tensor(current_state[None, :], dtype=tf.float32))
-        probs = tf.nn.softmax(logits).numpy()[0]
-        action = np.random.choice(len(probs), p=probs)
+            episode_reward += reward
+            thread_step_counter += 1
+            state = next_state
+
+          values = values.stack()
+          rewards = rewards.stack()
+          action_probs = action_probs.stack()
+          probs = probs.stack()
+          
+          print("----------- START GRAD -----------")
+          
+          # Final reward is 0 if done, else bootstrap with V(s)
+          discounted_sum = tf.constant(0.0)
+          if not done:
+            _, value = self.local_model(tf.cast(state[np.newaxis, :], tf.float32))
+            discounted_sum += value.numpy()[0]
+
+          # Compute Returns
+          returns = tf.TensorArray(dtype=tf.float32, size=tf.shape(rewards)[0])
+          rewards = rewards[::-1]
+          for i in tf.range(tf.shape(rewards)[0]):
+            discounted_sum = rewards[i] + gamma * discounted_sum
+            returns = returns.write(i, discounted_sum)
+          returns = returns.stack()[::-1]
+
+          if False:
+            returns = ((returns - tf.math.reduce_mean(returns)) / 
+                       (tf.math.reduce_std(returns) + eps))
+
+          # Advantage
+          advantages = returns - values
+          
+          # Critic loss
+          critic_loss = critic_loss_func(values, returns)
+
+          # Actor loss
+          action_log_probs = tf.math.log(action_probs)
+          entropy = -tf.math.reduce_sum(probs * tf.math.log(probs))
+          actor_loss = -tf.math.reduce_sum(action_log_probs * advantage) - args["beta"] * entropy
+          
+          loss = critic_loss + actor_loss
+          episode_loss += loss
+
+        print("----------- APPLY GRAD -----------")
+        grads = tape.gradient(total_loss, self.local_model.trainable_weights)
         
-        new_state, reward, done, _ = self.env.step(action)
+        # Apply local gradients to global model
+        self.local_model.set_weights(self.global_weights)
+        self.global_opt.apply_gradients(zip(grads, self.local_model.trainable_weights))
+        
+        # Update global model with new weights
+        for local_weight, global_weight in (self.local_model.get_weights(), self.global_weights):
+          global_weight[:] = local_weight[:]
+
         if done:
-          reward = -1.0
-        ep_reward += reward
-        self.states.append(current_state)
-        self.actions.append(action)
-        self.rewards.append(reward)
+          if Worker.global_ma_reward == 0:
+            Worker.global_ma_reward = episode_reward
+          else:
+            Worker.global_ma_reward = Worker.global_ma_reward * 0.95 + episode_reward * 0.05
 
-        if thread_step_counter % args["update_freq"] == 0 or done:
-          # Calculate gradient wrt to local model
-          with tf.GradientTape() as tape:
-            est_reward = 0.0
-            if not done:
-              est_reward = self.local_model(
-                tf.convert_to_tensor(new_state[None, :], dtype=tf.float32)
-              )[-1].numpy()[0]
+          print("Moving Average Reward: {}\tEpisode Reward: {}\tLoss: {}\tThread Steps: {}\tWorker:{}".format(
+            Worker.global_ma_reward, episode_reward, episode_loss, thread_step_counter, worker_id))
+          
+          self.results.put(Worker.global_ma_reward)
+          Worker.global_ma_reward =  global_ep_reward
 
-            # Get discounted rewards
-            discounted_rewards = []
-            for reward in self.rewards[::-1]:  # reverse buffer r
-              est_reward = reward + args["gamma"] * est_reward
-              discounted_rewards.append(est_reward)
-            discounted_rewards[::-1]
-
-            logits, values = self.local_model(
-              tf.convert_to_tensor(np.vstack(self.states), dtype=tf.float32)
-            )
-            # Get our advantages
-            advantage = tf.convert_to_tensor(np.array(discounted_rewards)[:, None], type=tf.float32) - values
-            # Value loss
-            value_loss = advantage ** 2
-
-            # Calculate our policy loss
-            policy = tf.nn.softmax(logits)
-            entropy = tf.nn.softmax_cross_entropy_with_logits(labels=policy, logits=logits)
-
-            policy_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.actions, logits=logits)
-            policy_loss *= tf.stop_gradient(advantage)
-            policy_loss -= 0.01 * entropy
-            total_loss = tf.reduce_mean((0.5 * value_loss + policy_loss))
-            return total_loss
-
-            # FIX
-            total_loss = self.compute_loss(done, new_state, mem, )
+          if episode_reward > Worker.global_top_reward:
+            with Worker.write_lock:
+              self.global_model.save_weights(self.save_dir + 'model.h5')
+              Worker.global_top_reward = episode_reward
+    except Exception as e:
+      print(e)
+      return
 
 
-          self.ep_loss += total_loss
-          grads = tape.gradient(total_loss, self.local_model.trainable_weights)
-          # Apply local gradients to global model
-          self.opt.apply_gradients(zip(grads, self.global_model.trainable_weights))
-          # Update local model with new weights
-          self.local_model.set_weights(self.global_model.get_weights())
-
-          clear_mem()
-
-          if done:
-            Worker.global_moving_average_reward = record(
-              Worker.global_episode, ep_reward, self.worker_idx,
-              Worker.global_moving_average_reward, self.result_queue,
-              self.ep_loss, ep_steps
-            )
-
-            if global_ep_reward == 0:
-              global_ep_reward = episode_reward
-            else:
-              global_ep_reward = global_ep_reward * 0.99 + episode_reward * 0.01
-            print(f"Episode: {episode} | "
-              f"Moving Average Reward: {int(global_ep_reward)} | "
-              f"Episode Reward: {int(episode_reward)} | "
-              f"Loss: {int(total_loss / float(num_steps) * 1000) / 1000} | "
-              f"Steps: {num_steps} | "
-              f"Worker: {worker_idx}"
-            )
-            result_queue.put(global_ep_reward)
-            return global_ep_reward
-
-            if ep_reward > Worker.best_score:
-              with Worker.save_lock:
-                print("Saving best model to {}, "
-                      "episode score: {}".format(self.save_dir, ep_reward))
-                self.global_model.save_weights(
-                    os.path.join(self.save_dir,
-                                 'model_{}.h5'.format(self.game_name))
-                )
-                Worker.best_score = ep_reward
-            Worker.global_episode += 1
-        ep_steps += 1
-
-        thread_step_counter += 1
-        current_state = new_state
-    self.result_queue.put(None)
-
-class MasterAgent():
-  def __init__(self, args):
-    self.game = args["game"]
+class Master():
+  def __init__(self):
     self.save_dir = args["save_dir"]
     if not os.path.exists(args["save_dir"]):
       os.makedirs(args["save_dir"])
 
-    env = gym.make(self.game)
+    env = gym.make('SpaceInvaders-v0')
     self.state_size = env.observation_space.shape # (210, 160, 3)
     self.action_size = env.action_space.n # 6
     self.opt = tf.compat.v1.train.AdamOptimizer(args["lr"], use_locking=True)
 
+    # Initialize the global model
     self.global_model = ActorCritic(self.state_size, self.action_size)
-    self.global_model(
-        tf.convert_to_tensor(np.random.random(self.state_size), dtype=tf.float32)
-    )
+    self.global_model(np.random.random((1, *self.state_size)).astype("float32"))
 
   def train(self):
-    res_queue = Queue()
-    workers = [Worker(
-      self.state_size,
-      self.action_size,
-      self.global_model,
-      self.opt, res_queue,
-      i, game=self.game,
-      save_dir=self.save_dir
-    ) for i in range(mp.cpu_count())]
+    with SharedMemoryManager() as smm:
+      res_queue = Queue()
 
-    for i, worker in enumerate(workers):
-      print("Starting worker {}".format(i))
-      worker.start()
+      model_weights = self.global_model.get_weights()
+      weight_memory = [smm.SharedMemory(size=x.nbytes) for x in model_weights]
+      weight_names, weight_shapes, weight_dtype = [], [], None
+      shared_weights = []
+      for memory, weight in zip(weight_memory, model_weights):
+        print(memory.name)
+        new_weight = np.ndarray(weight.shape, dtype=weight.dtype, buffer=memory.buf)
+        new_weight[:] = weight[:]
+        weight_names.append(memory.name)
+        weight_shapes.append(weight.shape)
+        weight_dtype = weight.dtype
+        shared_weights.append(new_weight)
 
-    moving_average_rewards = []
-    while True:
-      reward = res_queue.get()
-      if reward is not None:
-        moving_average_rewards.append(reward)
-      else:
-        break
-    [w.join() for w in workers]
+      workers = [Worker(
+        self.state_size,
+        self.action_size,
+        weight_names,
+        weight_shapes, 
+        weight_dtype,
+        self.opt, 
+        res_queue,
+        i, 
+        write_fp=self.save_dir
+      ) for i in range(1)]#mp.cpu_count())]
 
-    plt.plot(moving_average_rewards)
+      for worker in workers:
+        worker.start()
+      for worker in workers:
+        worker.join()
+
+    res_queue_items = []
+    try:
+      while True:
+        res_queue_items.append(res_queue.get())
+    except:
+      pass
+
+    print(res_queue_items)
+    plt.plot(res_queue_items)
     plt.ylabel('Moving average ep reward')
     plt.xlabel('Step')
-    plt.savefig(os.path.join(self.save_dir,
-                             '{} Moving Average.png'.format(self.game_name)))
+    plt.savefig(self.save_dir + 'Moving Average.png')
     plt.show()
 
   def play(self):
@@ -257,18 +285,16 @@ class MasterAgent():
     finally:
       env.close()
 
+args = {
+  "lr": 0.0005,
+  "save_dir": ".",
+  "gamma": 0.99,
+  "beta": 0.1,
+  "max_steps": 100,
+  "update_freq": 5
+}
+master = Master()
+master.train()
 
 
-with SharedMemoryManager() as smm:
-  weights_lst = [smm.SharedMemory(size=x.nbytes) for x in model_weights]
-  for weight in weights_lst:
-    print(weight.name, weight.size)
-
-  p1 = Process(target=do_work, args=(sl, 0, 1000))
-  p2 = Process(target=do_work, args=(sl, 1000, 2000))
-  p1.start()
-  p2.start()  # A multiprocessing.Pool might be more efficient
-  p1.join()
-  p2.join()   # Wait for all work to complete in both processes
-  total_result = sum(sl)  # Consolidate the partial results now in sl
 
