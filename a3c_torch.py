@@ -31,12 +31,11 @@ class SharedRMSprop(optim.RMSprop):
                  params,
                  lr=1e-2,
                  alpha=0.99,
-                 eps=1e-8,
                  weight_decay=0,
                  momentum=0,
                  centered=False):
         super(SharedRMSprop, self).__init__(
-            params, lr, alpha, eps, weight_decay, momentum, centered)
+            params, lr, alpha, 1e-8, weight_decay, momentum, centered)
 
         for group in self.param_groups:
             for p in group['params']:
@@ -50,193 +49,113 @@ class SharedRMSprop(optim.RMSprop):
                 state['momentum_buffer'].share_memory_()
                 state['grad_avg'].share_memory_()
 
-def train(rank, args, global_model, global_opt, device, write_fp):
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
-    local_model = copy.deepcopy(global_model)
-    
 
-    for epoch in range(1, args.epochs + 1):        
-        for batch_idx, (data, target) in enumerate(train_loader):
-            optimizer.zero_grad()
-            output = model(data.to(device))
-            loss = F.nll_loss(output, target.to(device))
-            loss.backward()
-            optimizer.step()
-            if batch_idx % args.log_interval == 0:
-                print('{}\tTrain Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                    rank, epoch,
-                    batch_idx * len(data), len(train_loader.dataset),
-                    100. * batch_idx / len(train_loader), loss.item()
-                ))
-                if args.dry_run:
-                    break
+def train(rank, args, transform, device, global_model, opt, opt_lock, step_counter, ma_reward):
+    torch.manual_seed(args.seed + rank)
 
-    global_step_counter, global_ma_reward, global_top_reward = 0, 0, 0
-    write_lock = Lock()
+    # Setup env
+    env = gym.make('SpaceInvaders-v0')
+    state_size = env.observation_space.shape
+    action_size = env.action_space.n
 
-    self.state_size = state_size
-    self.action_size = action_size
-    self.local_model = ActorCritic(self.state_size, self.action_size)
-    self.local_model(np.random.random((1, *self.state_size)).astype("float32"))
+    # Copy Global Model
+    local_model = ActorCritic(state_size, action_size).to(device)
+    local_model.load_state_dict(global_model.state_dict())
 
-    self.global_opt = global_opt
-    self.results = results
-    self.worker_id = worker_id
-    self.write_fp = write_fp
+    thread_step_counter = 1
+    # Run an episode if the global maximum hasn't been reached
+    while step_counter.value < args.max_steps:
+        # Sync Models
+        local_model.load_state_dict(global_model.state_dict())
 
-    self.env = gym.make('SpaceInvaders-v0').unwrapped
-    self.episode_loss = 0.0
+        episode_reward, episode_loss = 0, 0
+        t_start = thread_step_counter
+        state = transform(env.reset())
+        
+        # Run simulation until episode done or update time
+        values, rewards, actions, action_probs = [], [], [], []
+        done = False
+        while not done and thread_step_counter - t_start != args.update_freq:
+            print("Time", t_start, thread_step_counter)
+            
+            # Take action according to policy
+            logits, value = local_model(state.unsqueeze(0))
+            probs = F.softmax(logits, dim=-1)
+            action = torch.multinomial(probs, 1).detach()
 
-    self.weight_names = weight_names
-    self.weight_shapes = weight_shapes
-    self.weight_dtype = weight_dtype
+            next_state, reward, done, _ = env.step(action)
+            state = transform(next_state)
 
-    print("WORKER LOAD START")
-    print(list(map(lambda x: x.shape, self.local_model.get_weights())))
+            # Store action probs, values, and rewards
+            rewards.append(reward)
+            values.append(value)
+            actions.append(action)
+            action_probs.append(probs)
+            
+            # Update counters
+            step_counter.value  += 1
+            thread_step_counter += 1
 
-    self.local_weights = []
-    self.pull_weights()
+        rewards = torch.tensor(rewards).unsqueeze(1)  # (t, 1)
+        values = torch.cat(values, 0)                 # (t, 1)
+        actions = torch.cat(actions, 0)               # (t, 1)
+        action_probs = torch.cat(action_probs, 0)     # (t, action_space)
 
-    print("WORKER LOAD MIDDLE")
-    print(list(map(lambda x: x.shape, self.local_model.get_weights())))
+        print(rewards)
+        print(values)
+        print(actions)
+        print(action_probs)
+        
+        # Bootstrap the last state
+        R = torch.zeros(1, 1)
+        if not done:
+            _, value = local_model(state.unsqueeze(0))
+            R = value.detach()
+        
+        # Compute Returns
+        returns = []
+        for i in range(len(rewards))[::-1]:
+            R = rewards[i] + args.gamma * R
+            returns.append(R)
+        returns = torch.stack(returns[::-1]) # (t, 1)
+        
+        # Compute values needed in loss calculation
+        log_probs = torch.log(action_probs)                     # (t, action_space)
+        log_action_probs = torch.gather(log_probs, 1, actions)  # (t, 1)
+        advantage = returns - values                            # (t, 1)
+        entropy = -torch.sum(action_probs * log_probs)          # (1)
+        print(entropy.item(), -torch.sum(log_action_probs * advantage).item())
+        # Calculate losses
+        actor_loss = -torch.sum(log_action_probs * advantage) - args.beta * entropy
+        critic_loss = torch.sum(advantage.pow(2))
+        total_loss = actor_loss + critic_loss
+        print("Loss", actor_loss.item(), critic_loss.item())
 
-    self.local_model(np.random.random((1, *self.state_size)).astype("float32"))
+        # Calculate gradient and clip to maximum norm
+        total_loss.backward()
+        nn.utils.clip_grad_norm_(local_model.parameters(), args.max_grad)
+        
+        # Propogate gradients to shared model
+        with opt_lock:
+            for l_param, g_param in zip(local_model.parameters(), global_model.parameters()):
+                g_param._grad = l_param.grad.clone()
+            opt.step()
+            opt.zero_grad()
+        local_model.zero_grad()
+        # aaa
 
-    print("WORKER LOAD")
-
-    def run(self):
-        thread_step_counter = 1
-
-        # Run an episode if the global maximum hasn't stopped
-        while Worker.global_step_counter < args["max_steps"]:
-            # Reset and get params?
-            episode_reward, episode_loss = 0, 0
-            t_start = thread_step_counter
-            state = self.env.reset()
-            print("----------- START ENV -----------")
-            print(state.shape)
-            # Calculate gradient wrt to local model
-            with tf.GradientTape() as tape:
-            # Create arrays to track and hold our results
-                values = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
-                rewards = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
-                action_probs = tf.TensorArray(
-                    dtype=tf.float32, size=0, dynamic_size=True)
-                probs = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
-
-                # Run simulation until episode done or update time
-                done = False
-                while not done and thread_step_counter - t_start != args["update_freq"]:
-                    print("Time", thread_step_counter, t_start)
-                    # Take action according to policy
-                    logits, value = self.local_model(tf.convert_to_tensor(
-                        state[np.newaxis, :], dtype=tf.float32))
-                    print(logits[0], value[0])
-                    probs = tf.nn.softmax(logits).numpy()[0]
-                    action = np.random.choice(len(probs), p=probs)
-                    next_state, reward, done, _ = self.env.step(action)
-
-                    print(reward)
-
-                    # Store action probs, values, and rewards
-                    t = thread_step_counter - t_stasrt
-                    values = values.write(t, value[0])
-                    rewards = rewards.write(t, reward)
-                    action_probs = action_probs.write(t, probs[action])
-                    probs = probs.write(t, probs)
-
-                    episode_reward += reward
-                    thread_step_counter += 1
-                    state = next_state
-
-                values = values.stack()
-                rewards = rewards.stack()
-                action_probs = action_probs.stack()
-                probs = probs.stack()
-
-                print("----------- START GRAD -----------")
-
-                # Final reward is 0 if done, else bootstrap with V(s)
-                discounted_sum = tf.constant(0.0)
-                if not done:
-                    _, value = self.local_model(
-                        tf.cast(state[np.newaxis, :], tf.float32))
-                    discounted_sum += value.numpy()[0]
-
-                # Compute Returns
-                returns = tf.TensorArray(dtype=tf.float32, size=tf.shape(rewards)[0])
-                rewards = rewards[::-1]
-                for i in tf.range(tf.shape(rewards)[0]):
-                    discounted_sum = rewards[i] + gamma * discounted_sum
-                    returns = returns.write(i, discounted_sum)
-                returns = returns.stack()[::-1]
-
-                if False:
-                    returns = ((returns - tf.math.reduce_mean(returns)) /
-                            (tf.math.reduce_std(returns) + eps))
-
-                # Advantage
-                advantages = returns - values
-
-                # Critic loss
-                critic_loss = critic_loss_func(values, returns)
-
-                # Actor loss
-                action_log_probs = tf.math.log(action_probs)
-                entropy = -tf.math.reduce_sum(probs * tf.math.log(probs))
-                actor_loss = - \
-                    tf.math.reduce_sum(action_log_probs *
-                                        advantage) - args["beta"] * entropy
-
-                loss = critic_loss + actor_loss
-                episode_loss += loss
-
-            print("----------- APPLY GRAD -----------")
-            grads = tape.gradient(total_loss, self.local_model.trainable_weights)
-
-            # Apply local gradients to global model
-            self.local_model.set_weights(self.global_weights)
-            self.global_opt.apply_gradients(
-                zip(grads, self.local_model.trainable_weights))
-
-            # Update global model with new weights
-            for local_weight, global_weight in (self.local_model.get_weights(), self.global_weights):
-                global_weight[:] = local_weight[:]
-
-            if done:
-                if Worker.global_ma_reward == 0:
-                    Worker.global_ma_reward = episode_reward
+        if done:
+            with torch.no_grad():
+                episode_reward = torch.sum(rewards).item()
+                episode_loss = total_loss.item()
+                if ma_reward.value == 0.0:
+                    ma_reward.value = episode_reward
                 else:
-                    Worker.global_ma_reward = Worker.global_ma_reward * 0.95 + episode_reward * 0.05
+                    ma_reward.value = ma_reward.value * 0.95 + episode_reward * 0.05
 
-                print("Moving Average Reward: {}\tEpisode Reward: {}\tLoss: {}\tThread Steps: {}\tWorker:{}".format(
-                    Worker.global_ma_reward, episode_reward, episode_loss, thread_step_counter, worker_id))
-
-                self.results.put(Worker.global_ma_reward)
-                Worker.global_ma_reward = global_ep_reward
-
-                if episode_reward > Worker.global_top_reward:
-                    with Worker.write_lock:
-                        self.global_model.save_weights(self.save_dir + 'model.h5')
-                        Worker.global_top_reward = episode_reward
-
-def test(args, model, device, dataset, dataloader_kwargs):
-    test_loader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
-    model.eval()
-    test_loss = 0
-    correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            output = model(data.to(device))
-            test_loss += F.nll_loss(output, target.to(device), reduction='sum').item() # sum up batch loss
-            pred = output.max(1)[1] # get the index of the max log-probability
-            correct += pred.eq(target.to(device)).sum().item()
-
-    test_loss /= len(test_loader.dataset)
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
-
+                print("Moving Average Reward: {ma_reward}\t" +\
+                      "Episode Reward: {episode_reward}\tLoss: {episode_loss}\t" +
+                      "Thread Steps: {thread_step_counter}\tWorker: {worker_id}")
 
 class ActorCritic(nn.Module):
     def __init__(self, state_size, action_size):
@@ -269,22 +188,28 @@ class ActorCritic(nn.Module):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch A3C')
-    parser.add_argument('--epochs', type=int, default=10, metavar='N',
-                        help='number of epochs to train (default: 10)')
-    parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
-                        help='learning rate (default: 0.01)')
-    parser.add_argument('--momentum', type=float, default=0.5, metavar='M',
-                        help='SGD momentum (default: 0.5)')
-    parser.add_argument('--seed', type=int, default=1, metavar='S',
+    parser.add_argument('--max_steps', type=int, default=100,
+                        help='number of steps to train (default: 100)')
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='learning rate (default: 0.001)')
+    parser.add_argument('--alpha', type=float, default=0.99,
+                        help='RMSprop alpha (default: 0.99)')
+    parser.add_argument('--weight_decay', type=float, default=0.0,
+                        help='RMSprop weight decay (default: 0)')
+    parser.add_argument('--momentum', type=float, default=0.0,
+                        help='RMSprop momentum (default: 0)')
+    parser.add_argument('--update_freq', type=int, default=5,
+                        help='number of steps between syncs (default: 5)')
+    parser.add_argument('--gamma', type=float, default=0.99,
+                        help='discount rate for returns (default: 0.99)')
+    parser.add_argument('--beta', type=float, default=0.05,
+                        help='scaling factor for entropy (default: 0.05)')
+    parser.add_argument('--max_grad', type=float, default=5.0,
+                        help='value to clip gradients at (default: 5.0)')
+    parser.add_argument('--num-processes', type=int, default=-1,
+                        help='number of training processes (default: -1 = cpu count)')
+    parser.add_argument('--seed', type=int, default=1,
                         help='random seed (default: 1)')
-    parser.add_argument('--log-interval', type=int, default=10, metavar='N',
-                        help='how many batches to wait before logging training status')
-    parser.add_argument('--num-processes', type=int, default=2, metavar='N',
-                        help='how many training processes to use (default: 2)')
-    parser.add_argument('--cuda', action='store_true', default=False,
-                        help='enables CUDA training')
-    parser.add_argument('--dry-run', action='store_true', default=False,
-                        help='quickly check a single pass')
     args = parser.parse_args()
 
     device = torch.device("cpu")
@@ -295,135 +220,25 @@ if __name__ == '__main__':
     ])
     torch.manual_seed(args.seed)
 
+    mp.set_start_method('spawn')
+
     env = gym.make('SpaceInvaders-v0')
     state_size = env.observation_space.shape
     action_size = env.action_space.n
 
-    mp.set_start_method('spawn')
     model = ActorCritic(state_size, action_size).to(device)
-    opt = SharedRMSprop(model.parameters())
-    print("MADE OPT")
-    test_in = np.random.randint(0, 256, state_size, dtype=np.uint8)
-    test_in = transform(test_in)
-    test_in = test_in.view(-1, *test_in.shape)
-    print(model(test_in))
+    model.share_memory()
+    opt = SharedRMSprop(model.parameters(), args.lr, args.alpha, args.weight_decay, args.momentum, False)
+    opt_lock = mp.Lock()
 
-    model.share_memory() # gradients are allocated lazily, so they are not shared here
-
+    step_counter, ma_reward = mp.Value('d', 0.0), mp.Value('d', 0.0)
     processes = []
+    if args.num_processes == -1:
+        args.num_processes = mp.cpu_count()
     for rank in range(args.num_processes):
-        p = mp.Process(target=train, args=(rank, args, model, device, dataset1, kwargs))
-        # We first train the model across `num_processes` processes
+        p = mp.Process(target=train, args=(
+            rank, args, transform, device, model, opt, opt_lock, step_counter, ma_reward))
         p.start()
         processes.append(p)
     for p in processes:
         p.join()
-
-    # Once training is complete, we can test the model
-    test(args, model, device, dataset2, kwargs)
-
-
-class Master():
-  def __init__(self):
-    self.save_dir = args["save_dir"]
-    if not os.path.exists(args["save_dir"]):
-      os.makedirs(args["save_dir"])
-
-    env = gym.make('SpaceInvaders-v0')
-    self.state_size = env.observation_space.shape # (210, 160, 3)
-    self.action_size = env.action_space.n # 6
-    self.opt = tf.compat.v1.train.AdamOptimizer(args["lr"], use_locking=True)
-
-    # Initialize the global model
-    self.global_model = ActorCritic(self.state_size, self.action_size)
-    self.global_model(np.random.random((1, *self.state_size)).astype("float32"))
-    print("Global")
-    print(list(map(lambda x: x.shape, self.global_model.get_weights())))
-
-  def train(self):
-    with SharedMemoryManager() as smm:
-      res_queue = Queue()
-
-      model_weights = self.global_model.get_weights()
-      weight_memory = [smm.SharedMemory(size=x.nbytes) for x in model_weights]
-      weight_names, weight_shapes, weight_dtype = [], [], None
-      shared_weights = []
-      for memory, weight in zip(weight_memory, model_weights):
-        print(memory.name)
-        new_weight = np.ndarray(weight.shape, dtype=weight.dtype, buffer=memory.buf)
-        new_weight[:] = weight[:]
-        weight_names.append(memory.name)
-        weight_shapes.append(weight.shape)
-        weight_dtype = weight.dtype
-        shared_weights.append(new_weight)
-
-      workers = [Worker(
-        self.state_size,
-        self.action_size,
-        weight_names,
-        weight_shapes, 
-        weight_dtype,
-        self.opt, 
-        res_queue,
-        i, 
-        write_fp=self.save_dir
-      ) for i in range(1)] #mp.cpu_count())]
-
-      for worker in workers:
-        worker.start()
-      for worker in workers:
-        worker.join()
-
-    res_queue_items = []
-    try:
-      while True:
-        res_queue_items.append(res_queue.get())
-    except:
-      pass
-
-    print(res_queue_items)
-    plt.plot(res_queue_items)
-    plt.ylabel('Moving average ep reward')
-    plt.xlabel('Step')
-    plt.savefig(self.save_dir + 'Moving Average.png')
-    plt.show()
-
-  def play(self):
-    env = gym.make(self.game_name).unwrapped
-    state = env.reset()
-    model = self.global_model
-    model_path = os.path.join(self.save_dir, 'model_{}.h5'.format(self.game_name))
-    print('Loading model from: {}'.format(model_path))
-    model.load_weights(model_path)
-    done = False
-    step_counter = 0
-    reward_sum = 0
-
-    try:
-      while not done:
-        env.render(mode='rgb_array')
-        policy, value = model(tf.convert_to_tensor(state[None, :], dtype=tf.float32))
-        policy = tf.nn.softmax(policy)
-        action = np.argmax(policy)
-        state, reward, done, _ = env.step(action)
-        reward_sum += reward
-        print("{}. Reward: {}, action: {}".format(step_counter, reward_sum, action))
-        step_counter += 1
-    except KeyboardInterrupt:
-      print("Received Keyboard Interrupt. Shutting down.")
-    finally:
-      env.close()
-
-args = {
-  "lr": 0.0005,
-  "save_dir": ".",
-  "gamma": 0.99,
-  "beta": 0.1,
-  "max_steps": 100,
-  "update_freq": 5
-}
-master = Master()
-master.train()
-
-
-
