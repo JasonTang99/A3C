@@ -1,6 +1,5 @@
 import scipy.signal
 from random import choice
-from time import sleep, time
 import gym
 import numpy as np
 import os
@@ -13,6 +12,8 @@ from typing import Tuple
 import warnings
 import argparse
 import copy
+from collections import deque
+import time
 
 import torch
 import torch.optim as optim
@@ -49,8 +50,19 @@ class SharedRMSprop(optim.RMSprop):
                 state['momentum_buffer'].share_memory_()
                 state['grad_avg'].share_memory_()
 
+def transform(image_in_1, image_in_2):
+    # Take max pixel values between the 2 frames
+    image_in = np.maximum(image_in_1, image_in_2)
+    # To PIL image
+    image_out = Image.fromarray(image_in)
+    # RGB -> Luminosity (Grayscale)
+    image_out = image_out.convert("L")
+    # Resize
+    image_out = image_out.resize((84, 84))
+    # Back to Tensor
+    return transforms.functional.to_tensor(image_out)
 
-def train(rank, args, transform, device, global_model, opt, opt_lock, step_counter, ma_reward):
+def train(rank, args, device, global_model, opt, opt_lock, step_counter, ma_reward):
     torch.manual_seed(args.seed + rank)
 
     # Setup env
@@ -58,33 +70,44 @@ def train(rank, args, transform, device, global_model, opt, opt_lock, step_count
     state_size = env.observation_space.shape
     action_size = env.action_space.n
 
-    # Copy Global Model
+    state = env.reset()
+    next_state, _, _, _ = env.step(0)
+
+    # Keep a deque of 4 processed states as input
+    proc_state = transform(state, next_state)
+    proc_states = deque([
+        proc_state.clone(), proc_state.clone(), 
+        proc_state.clone(), proc_state.clone()
+    ], maxlen=4)
+    state = next_state
+
+    # Setup local model
     local_model = ActorCritic(state_size, action_size).to(device)
-    local_model.load_state_dict(global_model.state_dict())
 
     thread_step_counter = 1
+    ep_reward, ep_loss = 0.0, 0.0
     # Run an episode if the global maximum hasn't been reached
     while step_counter.value < args.max_steps:
         # Sync Models
         local_model.load_state_dict(global_model.state_dict())
-
-        episode_reward, episode_loss = 0, 0
-        t_start = thread_step_counter
-        state = transform(env.reset())
         
         # Run simulation until episode done or update time
         values, rewards, actions, action_probs = [], [], [], []
+        t_start = thread_step_counter
         done = False
+
         while not done and thread_step_counter - t_start != args.update_freq:
-            print("Time", t_start, thread_step_counter)
-            
             # Take action according to policy
-            logits, value = local_model(state.unsqueeze(0))
+            processed_input = torch.cat(tuple(proc_states)).unsqueeze(0)
+            logits, value = local_model(processed_input)
             probs = F.softmax(logits, dim=-1)
             action = torch.multinomial(probs, 1).detach()
-
             next_state, reward, done, _ = env.step(action)
-            state = transform(next_state)
+            
+            # Update states
+            proc_state = transform(state, next_state)
+            proc_states.append(proc_state)
+            state = next_state
 
             # Store action probs, values, and rewards
             rewards.append(reward)
@@ -95,41 +118,47 @@ def train(rank, args, transform, device, global_model, opt, opt_lock, step_count
             # Update counters
             step_counter.value  += 1
             thread_step_counter += 1
+        
+        # print("{:.2f}%".format(100 * step_counter.value / args.max_steps))
+        # env.render()
 
         rewards = torch.tensor(rewards).unsqueeze(1)  # (t, 1)
         values = torch.cat(values, 0)                 # (t, 1)
         actions = torch.cat(actions, 0)               # (t, 1)
         action_probs = torch.cat(action_probs, 0)     # (t, action_space)
 
-        print(rewards)
-        print(values)
-        print(actions)
-        print(action_probs)
-        
         # Bootstrap the last state
         R = torch.zeros(1, 1)
         if not done:
-            _, value = local_model(state.unsqueeze(0))
+            processed_input = torch.cat(tuple(proc_states)).unsqueeze(0)
+            _, value = local_model(processed_input)
             R = value.detach()
         
         # Compute Returns
         returns = []
         for i in range(len(rewards))[::-1]:
             R = rewards[i] + args.gamma * R
-            returns.append(R)
+            returns.extend(R)
         returns = torch.stack(returns[::-1]) # (t, 1)
         
         # Compute values needed in loss calculation
+        t = action_probs.shape[0]
         log_probs = torch.log(action_probs)                     # (t, action_space)
         log_action_probs = torch.gather(log_probs, 1, actions)  # (t, 1)
         advantage = returns - values                            # (t, 1)
-        entropy = -torch.sum(action_probs * log_probs)          # (1)
-        print(entropy.item(), -torch.sum(log_action_probs * advantage).item())
+        entropy = -torch.sum(action_probs * log_probs) / t      # (1)
+
         # Calculate losses
         actor_loss = -torch.sum(log_action_probs * advantage) - args.beta * entropy
         critic_loss = torch.sum(advantage.pow(2))
         total_loss = actor_loss + critic_loss
-        print("Loss", actor_loss.item(), critic_loss.item())
+
+        # print(entropy.item(), -torch.sum(log_action_probs * advantage).item())
+        # print("Advantage", advantage)
+        # print("Actions", actions)
+        # print("Probs", action_probs)
+        # print("Log Probs", log_action_probs)
+        # print("Loss", actor_loss.item(), critic_loss.item())
 
         # Calculate gradient and clip to maximum norm
         total_loss.backward()
@@ -142,26 +171,41 @@ def train(rank, args, transform, device, global_model, opt, opt_lock, step_count
             opt.step()
             opt.zero_grad()
         local_model.zero_grad()
-        # aaa
-
+        
+        with torch.no_grad():
+            ep_reward += torch.sum(rewards).item()
+            ep_loss += total_loss.item()
         if done:
             with torch.no_grad():
-                episode_reward = torch.sum(rewards).item()
-                episode_loss = total_loss.item()
                 if ma_reward.value == 0.0:
-                    ma_reward.value = episode_reward
+                    ma_reward.value = ep_reward
                 else:
-                    ma_reward.value = ma_reward.value * 0.95 + episode_reward * 0.05
+                    ma_reward.value = ma_reward.value * 0.95 + ep_reward * 0.05
 
-                print("Moving Average Reward: {ma_reward}\t" +\
-                      "Episode Reward: {episode_reward}\tLoss: {episode_loss}\t" +
-                      "Thread Steps: {thread_step_counter}\tWorker: {worker_id}")
+                print(f"Moving Average Reward: {ma_reward.value:.2f}\t" +
+                      f"Episode Reward: {ep_reward}\tLoss: {ep_loss:.4E}\t" +
+                      f"Thread-{rank} Steps: {thread_step_counter}")
+
+                ep_reward, ep_loss = 0.0, 0.0
+
+                # Reset Environment
+                state = env.reset()
+                next_state, _, _, _ = env.step(0)
+
+                # Keep a deque of 4 processed states as input
+                proc_state = transform(state, next_state)
+                proc_states = deque([
+                    proc_state.clone(), proc_state.clone(),
+                    proc_state.clone(), proc_state.clone()
+                ], maxlen=4)
+                state = next_state
+
 
 class ActorCritic(nn.Module):
     def __init__(self, state_size, action_size):
         super(ActorCritic, self).__init__()
         self.conv1 = nn.Conv2d(
-            in_channels=1,
+            in_channels=4,
             out_channels=16,
             kernel_size=8,
             stride=4
@@ -172,15 +216,15 @@ class ActorCritic(nn.Module):
             kernel_size=4,
             stride=2
         )
-        self.fc = nn.Linear(13824, 256)
+        self.fc = nn.Linear(2592, 256)
 
         self.actor = nn.Linear(256, action_size)
         self.critic = nn.Linear(256, 1)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x)) # (N, 16, 51, 39)
-        x = F.relu(self.conv2(x)) # (N, 32, 24, 18)
-        x = F.relu(self.fc(x.view(-1, 13824))) # (N, 256)
+        x = F.relu(self.conv1(x)) # (N, 16, 20, 20)
+        x = F.relu(self.conv2(x)) # (N, 32, 9, 9)
+        x = F.relu(self.fc(x.view(x.shape[0], -1)))  # (N, 256)
 
         a = self.actor(x) # (N, 6)
         c = self.critic(x) # (N, 1)
@@ -210,16 +254,15 @@ if __name__ == '__main__':
                         help='number of training processes (default: -1 = cpu count)')
     parser.add_argument('--seed', type=int, default=1,
                         help='random seed (default: 1)')
+    parser.add_argument('--save-fp', type=str, default=None,
+                        help='path to save model (default: None)')
+    parser.add_argument('--load-fp', type=str, default=None,
+                        help='path to load model (default: None)')
     args = parser.parse_args()
 
+    start = time.time()
     device = torch.device("cpu")
-    transform = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Grayscale(),
-        transforms.ToTensor()
-    ])
     torch.manual_seed(args.seed)
-
     mp.set_start_method('spawn')
 
     env = gym.make('SpaceInvaders-v0')
@@ -228,6 +271,12 @@ if __name__ == '__main__':
 
     model = ActorCritic(state_size, action_size).to(device)
     model.share_memory()
+    
+    if args.load_fp:
+        model.load_state_dict(torch.load(args.load_fp))
+    # model.load_state_dict(torch.load("a3c.pt"))
+    model.train()
+
     opt = SharedRMSprop(model.parameters(), args.lr, args.alpha, args.weight_decay, args.momentum, False)
     opt_lock = mp.Lock()
 
@@ -235,10 +284,16 @@ if __name__ == '__main__':
     processes = []
     if args.num_processes == -1:
         args.num_processes = mp.cpu_count()
+        # args.max_steps = 10000
     for rank in range(args.num_processes):
         p = mp.Process(target=train, args=(
-            rank, args, transform, device, model, opt, opt_lock, step_counter, ma_reward))
+            rank, args, device, model, opt, opt_lock, step_counter, ma_reward))
         p.start()
         processes.append(p)
     for p in processes:
         p.join()
+
+    print(f"Seconds taken: {time.time() - start}")
+    if args.save_fp:
+        torch.save(model.state_dict(), args.save_fp)
+    # torch.save(model.state_dict(), "a3c.pt")
