@@ -1,3 +1,8 @@
+"""
+A PyTorch implementation of the A3C (Asynchronous Advantage Actor Critic) paper: 
+https://arxiv.org/pdf/1602.01783.pdf
+"""
+
 import scipy.signal
 from random import choice
 import gym
@@ -67,7 +72,7 @@ def transform(image_in_1, image_in_2):
     return transforms.functional.to_tensor(image_out)
 
 def train(rank, args, device, global_model, opt, opt_lock, 
-          step_counter, ma_reward, ma_loss):
+          step_counter, max_reward, ma_reward, ma_loss):
     torch.manual_seed(args.seed + rank)
 
     # Setup env
@@ -124,8 +129,8 @@ def train(rank, args, device, global_model, opt, opt_lock,
             step_counter.value += 1
             thread_step_counter += 1
 
-        # if step_counter.value % 100 == 0:
-        #     print("{:.2f}%".format(100 * step_counter.value / args.max_steps))
+        if args.verbose > 1 and step_counter.value % 100 == 0:
+            print("{:.2f}%".format(100 * step_counter.value / args.max_steps))
         # env.render()
 
         rewards = torch.tensor(rewards).unsqueeze(1)  # (t, 1)
@@ -172,7 +177,8 @@ def train(rank, args, device, global_model, opt, opt_lock,
             opt.step()
             opt.zero_grad()
         local_model.zero_grad()
-
+        
+        # Update episode metrics
         with torch.no_grad():
             ep_reward += torch.sum(rewards).item()
             ep_loss += total_loss.item()
@@ -184,11 +190,25 @@ def train(rank, args, device, global_model, opt, opt_lock,
                 else:
                     ma_reward.value = ma_reward.value * 0.95 + ep_reward * 0.05
                     ma_loss.value = ma_loss.value * 0.95 + ep_loss * 0.05
+                
+                if max_reward.value < ma_reward.value and args.save_fp:
+                    max_reward.value = ma_reward.value
+                    if args.verbose > 1:
+                        print("Saving new top model")
+                    torch.save(
+                        local_model.state_dict(), 
+                        os.path.splitext(args.save_fp)[0] + "-best.pt"
+                    )
+                    torch.save({
+                        'model_state_dict': local_model.state_dict(),
+                        'optimizer_state_dict': opt.state_dict(),
+                    }, os.path.splitext(args.save_fp)[0] + "-ckt.tar")
 
-                print(f"MA Reward: {ma_reward.value:.2f}\t" +
-                      f"MA Loss: {ma_loss.value:.2f}\t" +
-                      f"EP Reward: {ep_reward}  \tEP Loss: {ep_loss:.4E}\t" +
-                      f"Thread-{rank} Steps: {thread_step_counter}")
+                if args.verbose > 0:
+                    print(f"MA Reward: {ma_reward.value:.2f}\t" +
+                        f"MA Loss: {ma_loss.value:.2f}\t" +
+                        f"EP Reward: {ep_reward}  \tEP Loss: {ep_loss:.4E}\t" +
+                        f"Thread-{rank} Steps: {thread_step_counter}")
 
                 ep_reward, ep_loss = 0.0, 0.0
 
@@ -253,7 +273,8 @@ def test(args, device, model, tries=3, max_steps=1000000):
                 break
         
         # Save as gif
-        print(f'Try #{t} reward: {ep_reward}')
+        if args.verbose > 0:
+            print(f'Try #{t} reward: {ep_reward}')
         images[0].save(f'invaders-{t}.gif', save_all=True,
                     append_images=images[1:], loop=0, duration=1)
     
@@ -290,23 +311,23 @@ class ActorCritic(nn.Module):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch A3C')
-    parser.add_argument('--max_steps', type=int, default=10000,
+    parser.add_argument('--max-steps', type=int, default=10000,
                         help='number of steps to train (default: 10000)')
     parser.add_argument('--lr', type=float, default=0.001,
                         help='learning rate (default: 0.001)')
     parser.add_argument('--alpha', type=float, default=0.99,
                         help='RMSprop alpha (default: 0.99)')
-    parser.add_argument('--weight_decay', type=float, default=0.0,
+    parser.add_argument('--weight-decay', type=float, default=0.0,
                         help='RMSprop weight decay (default: 0)')
     parser.add_argument('--momentum', type=float, default=0.0,
                         help='RMSprop momentum (default: 0)')
-    parser.add_argument('--update_freq', type=int, default=5,
+    parser.add_argument('--update-freq', type=int, default=5,
                         help='number of steps between syncs (default: 5)')
     parser.add_argument('--gamma', type=float, default=0.99,
                         help='discount rate for returns (default: 0.99)')
     parser.add_argument('--beta', type=float, default=0.05,
                         help='scaling factor for entropy (default: 0.05)')
-    parser.add_argument('--max_grad', type=float, default=5.0,
+    parser.add_argument('--max-grad', type=float, default=5.0,
                         help='value to clip gradients at (default: 5.0)')
     parser.add_argument('--num-processes', type=int, default=-1,
                         help='number of training processes (default: Max)')
@@ -316,8 +337,11 @@ if __name__ == '__main__':
                         help='path to save model (default: None)')
     parser.add_argument('--load-fp', type=str, default=None,
                         help='path to load model (default: None)')
-    parser.add_argument('--method', type=str, default="train",
-                        help='train or test (default: train)')
+    parser.add_argument('--verbose', type=int, default=1,
+                        help='verbosity, 2: All, 1: Some, 0: None')
+    parser.add_argument('--train', action='store_true', help="perform train")
+    parser.add_argument('--test', action='store_true', help="perform test")
+
     args = parser.parse_args()
 
     device = torch.device("cpu")
@@ -329,36 +353,44 @@ if __name__ == '__main__':
     action_size = env.action_space.n
 
     model = ActorCritic(state_size, action_size).to(device)
-    if args.load_fp:
-        model.load_state_dict(torch.load(args.load_fp))
+    opt = SharedRMSprop(model.parameters(), args.lr, args.alpha,
+                            args.weight_decay, args.momentum, False)
+    opt_lock = mp.Lock()
 
-    if args.method == "train":
+    if args.load_fp:
+        checkpoint = torch.load(args.load_fp)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        opt.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    if args.train:
         start = time.time()
 
         model.share_memory()
         model.train()
 
-        opt = SharedRMSprop(model.parameters(), args.lr, args.alpha,
-                            args.weight_decay, args.momentum, False)
-        opt_lock = mp.Lock()
-
-        step_counter, ma_reward, ma_loss = mp.Value(
-            'd', 0.0), mp.Value('d', 0.0), mp.Value('d', 0.0)
+        step_counter, max_reward, ma_reward, ma_loss = [
+            mp.Value('d', 0.0) for _ in range(4)]
+        
         processes = []
         if args.num_processes == -1:
             args.num_processes = mp.cpu_count()
         for rank in range(args.num_processes):
             p = mp.Process(target=train, args=(
-                rank, args, device, model, opt, opt_lock, 
-                step_counter, ma_reward, ma_loss))
+                rank, args, device, model, opt, opt_lock, step_counter,
+                max_reward, ma_reward, ma_loss))
             p.start()
             processes.append(p)
         for p in processes:
             p.join()
 
-        print(f"Seconds taken: {time.time() - start}")
+        if args.verbose > 0:
+            print(f"Seconds taken: {time.time() - start}")
         if args.save_fp:
-            torch.save(model.state_dict(), args.save_fp)
-    else:
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': opt.state_dict(),
+            }, args.save_fp)
+    if args.test:
+        model.eval()
         test(args, device, model)
 
