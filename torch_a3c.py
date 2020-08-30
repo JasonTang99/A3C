@@ -195,10 +195,13 @@ def train(rank, args, device, global_model, opt, opt_lock,
                     max_reward.value = ma_reward.value
                     if args.verbose > 1:
                         print("Saving new top model")
-                    torch.save(
-                        local_model.state_dict(), 
-                        os.path.splitext(args.save_fp)[0] + "-best.pt"
-                    )
+                        print("Saving new top model",
+                              file=open('output', 'w+'))
+                        
+                    # torch.save(
+                    #     local_model.state_dict(), 
+                    #     os.path.splitext(args.save_fp)[0] + "-best.pt"
+                    # )
                     torch.save({
                         'model_state_dict': local_model.state_dict(),
                         'optimizer_state_dict': opt.state_dict(),
@@ -206,9 +209,14 @@ def train(rank, args, device, global_model, opt, opt_lock,
 
                 if args.verbose > 0:
                     print(f"MA Reward: {ma_reward.value:.2f}\t" +
-                        f"MA Loss: {ma_loss.value:.2f}\t" +
-                        f"EP Reward: {ep_reward}  \tEP Loss: {ep_loss:.4E}\t" +
-                        f"Thread-{rank} Steps: {thread_step_counter}")
+                          f"MA Loss: {ma_loss.value:.2f}\t" +
+                          f"EP Reward: {ep_reward}  \tEP Loss: {ep_loss:.4E}\t" +
+                          f"Thread-{rank} Steps: {thread_step_counter}")
+                    print(f"MA Reward: {ma_reward.value:.2f}\t" +
+                          f"MA Loss: {ma_loss.value:.2f}\t" +
+                          f"EP Reward: {ep_reward}  \tEP Loss: {ep_loss:.4E}\t" +
+                          f"Thread-{rank} Steps: {thread_step_counter}",
+                          file=open('output', 'w+'))
 
                 ep_reward, ep_loss = 0.0, 0.0
 
@@ -275,6 +283,7 @@ def test(args, device, model, tries=3, max_steps=1000000):
         # Save as gif
         if args.verbose > 0:
             print(f'Try #{t} reward: {ep_reward}')
+            print(f'Try #{t} reward: {ep_reward}', file=open('output', 'w+'))
         images[0].save(f'invaders-{t}.gif', save_all=True,
                     append_images=images[1:], loop=0, duration=1)
     
