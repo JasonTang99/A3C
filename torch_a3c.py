@@ -3,22 +3,16 @@ A PyTorch implementation of the A3C (Asynchronous Advantage Actor Critic) paper:
 https://arxiv.org/pdf/1602.01783.pdf
 """
 
-import scipy.signal
-from random import choice
-import gym
 import numpy as np
-import os
-import matplotlib
+import gym
 import matplotlib.pyplot as plt
-from collections import namedtuple
-from itertools import count
 from PIL import Image
-from typing import Tuple
+
+import os
+import time
 import warnings
 import argparse
-import copy
 from collections import deque
-import time
 
 import torch
 import torch.optim as optim
@@ -28,40 +22,15 @@ import torch.multiprocessing as mp
 from torch.utils.data.sampler import Sampler
 from torchvision import datasets, transforms
 
-
-class SharedRMSprop(optim.RMSprop):
-    """
-    RMSprop with a shared state between processes.
-    """
-    def __init__(self,
-                 params,
-                 lr=1e-2,
-                 alpha=0.99,
-                 weight_decay=0,
-                 momentum=0,
-                 centered=False):
-        super(SharedRMSprop, self).__init__(
-            params, lr, alpha, 1e-8, weight_decay, momentum, centered)
-
-        for group in self.param_groups:
-            for p in group['params']:
-                state = self.state[p]
-                state['step'] = 0
-                state['square_avg'] = torch.zeros_like(p.data)
-                state['momentum_buffer'] = torch.zeros_like(p.data)
-                state['grad_avg'] = torch.zeros_like(p.data)
-
-                state['square_avg'].share_memory_()
-                state['momentum_buffer'].share_memory_()
-                state['grad_avg'].share_memory_()
+from shared_optim import SharedRMSprop
 
 
-def transform(image_in_1, image_in_2):
+def transform(image1, image2):
     # Performs preproocessing of atari environment as described in:
     # Human-level control through deep reinforcement learning by Mnih et al.
 
     # Take max pixel values between the 2 frames
-    image_in = np.maximum(image_in_1, image_in_2)
+    image_in = np.maximum(image1, image2)
     # To PIL image
     image_out = Image.fromarray(image_in)
     # RGB -> Luminosity (Grayscale)
@@ -71,7 +40,7 @@ def transform(image_in_1, image_in_2):
     # Back to Tensor
     return transforms.functional.to_tensor(image_out)
 
-def train(rank, args, device, global_model, opt, opt_lock, 
+def train(rank, args, device, global_model, opt, opt_lock, scheduler,
           step_counter, max_reward, ma_reward, ma_loss):
     torch.manual_seed(args.seed + rank)
 
@@ -176,6 +145,14 @@ def train(rank, args, device, global_model, opt, opt_lock,
                 g_param._grad = l_param.grad.clone()
             opt.step()
             opt.zero_grad()
+
+            for group in opt.param_groups:
+                print(group["lr"].value)
+            # Anneal Learning Rate on first worker
+            if rank == 0:
+                for group in opt.param_groups:
+                    group['lr'].value = scheduler.step()
+
         local_model.zero_grad()
         
         # Update episode metrics
@@ -196,7 +173,7 @@ def train(rank, args, device, global_model, opt, opt_lock,
                     if args.verbose > 1:
                         print("Saving new top model")
                         print("Saving new top model",
-                              file=open('output', 'w+'))
+                              file=open('output', 'a'))
                         
                     # torch.save(
                     #     local_model.state_dict(), 
@@ -216,7 +193,7 @@ def train(rank, args, device, global_model, opt, opt_lock,
                           f"MA Loss: {ma_loss.value:.2f}\t" +
                           f"EP Reward: {ep_reward}  \tEP Loss: {ep_loss:.4E}\t" +
                           f"Thread-{rank} Steps: {thread_step_counter}",
-                          file=open('output', 'w+'))
+                          file=open('output', 'a'))
 
                 ep_reward, ep_loss = 0.0, 0.0
 
@@ -283,7 +260,7 @@ def test(args, device, model, tries=3, max_steps=1000000):
         # Save as gif
         if args.verbose > 0:
             print(f'Try #{t} reward: {ep_reward}')
-            print(f'Try #{t} reward: {ep_reward}', file=open('output', 'w+'))
+            print(f'Try #{t} reward: {ep_reward}', file=open('output', 'a'))
         images[0].save(f'invaders-{t}.gif', save_all=True,
                     append_images=images[1:], loop=0, duration=1)
     
@@ -317,6 +294,14 @@ class ActorCritic(nn.Module):
         c = self.critic(x)  # (N, 1)
         return a, c
 
+class LRScheduler():
+    def __init__(self, args):
+        self.gamma = (1e-10 / args.lr) ** (args.update_freq * args.num_processes / args.max_steps)
+        self.lr = args.lr
+
+    def step(self):
+        self.lr *= self.gamma
+        return self.lr
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch A3C')
@@ -362,9 +347,11 @@ if __name__ == '__main__':
     action_size = env.action_space.n
 
     model = ActorCritic(state_size, action_size).to(device)
-    opt = SharedRMSprop(model.parameters(), args.lr, args.alpha,
-                            args.weight_decay, args.momentum, False)
+    opt = SharedRMSprop(model.parameters(), lr=args.lr, alpha=args.alpha, 
+                        eps=1e-8, weight_decay=args.weight_decay, 
+                        momentum=args.momentum, centered=False)
     opt_lock = mp.Lock()
+    scheduler = LRScheduler(args)
 
     if args.load_fp:
         checkpoint = torch.load(args.load_fp)
@@ -385,8 +372,8 @@ if __name__ == '__main__':
             args.num_processes = mp.cpu_count()
         for rank in range(args.num_processes):
             p = mp.Process(target=train, args=(
-                rank, args, device, model, opt, opt_lock, step_counter,
-                max_reward, ma_reward, ma_loss))
+                rank, args, device, model, opt, opt_lock, scheduler,
+                step_counter, max_reward, ma_reward, ma_loss))
             p.start()
             processes.append(p)
         for p in processes:
@@ -399,6 +386,7 @@ if __name__ == '__main__':
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': opt.state_dict(),
             }, args.save_fp)
+        
     if args.test:
         model.eval()
         test(args, device, model)
