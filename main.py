@@ -15,15 +15,13 @@ import argparse
 from collections import deque
 
 import torch
-import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.multiprocessing as mp
-from torch.utils.data.sampler import Sampler
-from torchvision import datasets, transforms
+from torchvision import transforms
 
 from shared_optim import SharedRMSprop
-
+from model import ActorCritic
 
 def transform(image1, image2):
     # Performs preproocessing of atari environment as described in:
@@ -61,7 +59,7 @@ def train(rank, args, device, global_model, opt, opt_lock, scheduler,
     state = next_state
 
     # Setup local model
-    local_model = ActorCritic(state_size, action_size).to(device)
+    local_model = ActorCritic([1, 4, 84, 84], action_size).to(device)
 
     thread_step_counter = 1
     ep_reward, ep_loss = 0.0, 0.0
@@ -263,36 +261,7 @@ def test(args, device, model, tries=3, max_steps=1000000):
             print(f'Try #{t} reward: {ep_reward}', file=open('output', 'a'))
         images[0].save(f'invaders-{t}.gif', save_all=True,
                     append_images=images[1:], loop=0, duration=1)
-    
 
-class ActorCritic(nn.Module):
-    def __init__(self, state_size, action_size):
-        super(ActorCritic, self).__init__()
-        self.conv1 = nn.Conv2d(
-            in_channels=4,
-            out_channels=16,
-            kernel_size=8,
-            stride=4
-        )
-        self.conv2 = nn.Conv2d(
-            in_channels=16,
-            out_channels=32,
-            kernel_size=4,
-            stride=2
-        )
-        self.fc = nn.Linear(2592, 256)
-
-        self.actor = nn.Linear(256, action_size)
-        self.critic = nn.Linear(256, 1)
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))  # (N, 16, 20, 20)
-        x = F.relu(self.conv2(x))  # (N, 32, 9, 9)
-        x = F.relu(self.fc(x.view(x.shape[0], -1)))  # (N, 256)
-
-        a = self.actor(x)  # (N, 6)
-        c = self.critic(x)  # (N, 1)
-        return a, c
 
 class LRScheduler():
     def __init__(self, args):
@@ -346,7 +315,7 @@ if __name__ == '__main__':
     state_size = env.observation_space.shape
     action_size = env.action_space.n
 
-    model = ActorCritic(state_size, action_size).to(device)
+    model = ActorCritic([1, 4, 84, 84], action_size).to(device)
     opt = SharedRMSprop(model.parameters(), lr=args.lr, alpha=args.alpha, 
                         eps=1e-8, weight_decay=args.weight_decay, 
                         momentum=args.momentum, centered=False)
