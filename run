@@ -1,0 +1,14 @@
+#!/bin/bash
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+
+python3 main.py \
+--steps 5000000 \
+--lr 0.001 \
+--beta 0.01 \
+--max-grad 5 \
+--num-procs 16 \
+--seed 42 \
+--save-fp model.tar \
+--train

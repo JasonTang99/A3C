@@ -20,7 +20,7 @@ def transform(image1, image2):
 
 class LRScheduler():
     def __init__(self, args):
-        self.gamma = (1e-10 / args.lr) ** (args.update_freq * args.num_processes / args.max_steps)
+        self.gamma = (1e-10 / args.lr) ** (args.update_freq * args.num_procs / args.steps)
         self.lr = args.lr
 
     def step(self):
