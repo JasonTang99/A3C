@@ -2,13 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class ActorCritic(nn.Module):
-    def __init__(self, in_shape, action_size, conv_layers=[(16, 8, 4), (32, 4, 2)], 
+    def __init__(self, in_shape, action_size, global_average_pool=False,
+                 conv_layers=[(16, 8, 4), (32, 4, 2)], 
                  dense_layers=[256], batchnorm=False):
         """
         Inputs:
-            in_shape: Shape of input (1, channels, height, width)
+            in_shape: Shape of input (batch_size, channel, height, width)
             action_size: Number of possible actions
             conv_layers: Properties per conv layer [(out_channels, kernel_size, stride)]
             dense_layers: Properties per conv layer [out_sizes]
